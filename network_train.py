@@ -5,45 +5,56 @@ Github: https://github.com/xmeng525/MultiResolutionKernelPredictionCNN
 @author: Xiaoxu Meng (xiaoxumeng1993@gmail.com)
 """
 
-import time
-import tensorflow as tf
-from dataLoader import dataLoader
-from network import MyModel
 import os
+import time
+import argparse
 import numpy as np
-from image_utils import *
+import tensorflow as tf
 from tensorflow.python.client import timeline
 
-# Training Parameters
-learning_rate = 0.0001
+from data_loader import dataLoader
+from network import MyModel
+from image_utils import save_image, batch_psnr
 
-total_epochs_stage1 = 60 #30
-validate_interval = 1
+INPUT_CHANNEL = 10
+TARGET_CHANNEL = 3
 
-validation_disp_list = [0, 3]
+# Export some validation results for debugging.
+VALID_DISPLAY_LIST = [0, 3]
 
-# Batch Parameters
-user_batch_size = 10 # for training and validation
-test_batch_size = 1 # for test
+parser = argparse.ArgumentParser()
+parser.add_argument('-r', '--data-dir', type=str, 
+    default='../../dataset/dataset_blockwise/BMFR-dataset')
+parser.add_argument('-train', '--train-dataset-name', type=str, 
+    default='living-room san-miguel sponza sponza-glossy sponza-moving-light')
+parser.add_argument('-test', '--test-dataset-name', type=str, 
+    default='classroom')
+parser.add_argument('-bs', '--batch-size', type=int, default=1)
+parser.add_argument('-ps', '--patch-size', type=int, default=128)
+parser.add_argument('-ppi', '--patch-per-image', type=int, default=50)
+parser.add_argument('-lr', '--learning-rate', type=float, default=0.0001)
+parser.add_argument('-ep', '--total-epochs', type=int, default=100)
+parser.add_argument('-vi', '--valid-interval', type=int, default=1)
+parser.add_argument('--export_all',action='store_true')
+args = parser.parse_args()
 
-patch_width = 128
-patch_height = 128
+data_dir = args.data_dir
+scene_train_list = args.train_dataset_name.split(' ')
+scene_valid_list = scene_train_list
+scene_test_list = args.test_dataset_name.split(' ')
+user_batch_size = args.batch_size
+patch_width = args.patch_size
+patch_height = args.patch_size
+patch_per_img = args.patch_per_image
+learning_rate = args.learning_rate
+valid_interval = args.valid_interval
+total_epochs = args.total_epochs
 
-train_start_idx = 5
+train_start_idx = 0
 train_per_scene = 55
 
-vali_start_idx = 55
-vali_per_scene = 5
-
-patch_per_img = 50
-
-input_channels = 10
-target_channels = 3
-
-data_dir = r'../../dataset/dataset_blockwise/BMFR-dataset'
-scene_train_list = ['san-miguel', 'sponza', 'living-room', 'sponza-moving-light', 'sponza-glossy']
-scene_validate_list = ['san-miguel', 'sponza', 'living-room', 'sponza-moving-light', 'sponza-glossy']
-scene_test_list = ['classroom']
+valid_start_idx = 55
+valid_per_scene = 5
 
 def tone_mapping(input_image):
     tone_mapped_color = np.clip(
@@ -51,7 +62,6 @@ def tone_mapping(input_image):
     return tone_mapped_color
 
 def _parse_function(proto):  # for training data
-    # with tf.name_scope("parse_data"):
     features = tf.parse_single_example(
         proto, features={
             'target': tf.FixedLenFeature([], tf.string),
@@ -59,76 +69,62 @@ def _parse_function(proto):  # for training data
 
     train_input = tf.decode_raw(features['input'], tf.float16)
     train_input = tf.reshape(train_input, [patch_height,
-                                           patch_width, input_channels])
+                                           patch_width, INPUT_CHANNEL])
 
     train_target = tf.decode_raw(features['target'], tf.float16)
     train_target = tf.reshape(train_target, [patch_height,
-                                             patch_width, target_channels])
+                                             patch_width, TARGET_CHANNEL])
     return (train_input, train_target)
 
-def my_mkdir(name):
-    if not os.path.exists(name):
-        print('creating folder', name)
-        os.makedirs(name)
-
 if __name__ == "__main__":
-    # Summary log directory
-    summary_dir = r'./summary_log'
-    my_mkdir(summary_dir)
-    stg1_summary_dir = os.path.join(summary_dir, 'stage1')
-    my_mkdir(stg1_summary_dir)
-    # Result directory
-    result_dir = r'./result'
-    my_mkdir(result_dir)
-    # Error log directory
-    err_log_dir = r'./errorlogs'
-    my_mkdir(err_log_dir)
-    model_dir = r'./model'
-    my_mkdir(model_dir)
-    stg1_model_dir = os.path.join(model_dir, 'stage1')
-    my_mkdir(stg1_model_dir)
+    model_dir = os.path.join(scene_test_list[0], 'model')
+    result_dir = os.path.join(scene_test_list[0], 'result', 'test_out')
+    errorlog_dir = os.path.join(scene_test_list[0], 'errorlog')
+    summarylog_dir = os.path.join(scene_test_list[0], 'summarylog')
 
-    seed = 1
-    rng = np.random.RandomState(seed)
+    os.makedirs(model_dir, exist_ok=True)
+    os.makedirs(result_dir, exist_ok=True)
+    os.makedirs(errorlog_dir, exist_ok=True)
+    os.makedirs(summarylog_dir, exist_ok=True)
+
     train_data = dataLoader(data_dir=data_dir, subset='train',
                             patch_width=patch_width,
                             patch_height=patch_height,
                             image_start_idx=train_start_idx,
                             img_per_scene=train_per_scene,
                             patch_per_img=patch_per_img,
-                            scene_list=scene_train_list, rng=rng)
-    validate_data = dataLoader(data_dir=data_dir, subset='validate',
-                               patch_width=patch_width,
-                               patch_height=patch_height,
-                               image_start_idx=vali_start_idx,
-                               img_per_scene=vali_per_scene,
-                               patch_per_img=patch_per_img,
-                               scene_list=scene_validate_list, rng=rng)
+                            scene_list=scene_train_list)
+    valid_data = dataLoader(data_dir=data_dir, subset='valid',
+                            patch_width=patch_width,
+                            patch_height=patch_height,
+                            image_start_idx=valid_start_idx,
+                            img_per_scene=valid_per_scene,
+                            patch_per_img=patch_per_img,
+                            scene_list=scene_valid_list)
 
     # Train
     train_dataset = tf.data.TFRecordDataset([train_data.dataset_name])
     # Parse the record into tensors.
     train_dataset = train_dataset.map(_parse_function)
-    train_dataset = train_dataset.shuffle(buffer_size=10000)
+    train_dataset = train_dataset.shuffle(buffer_size=2000)
     train_dataset = train_dataset.batch(user_batch_size)
 
     # Validate
-    validation_dataset = tf.data.TFRecordDataset(
-         [validate_data.dataset_name])
-    validation_dataset = validation_dataset.map(_parse_function)
-    validation_dataset = validation_dataset.batch(user_batch_size)
+    valid_dataset = tf.data.TFRecordDataset([valid_data.dataset_name])
+    valid_dataset = valid_dataset.map(_parse_function)
+    valid_dataset = valid_dataset.batch(user_batch_size)
 
     handle_small = tf.placeholder(tf.string, shape=[])
     iterator_structure_small = tf.data.Iterator.from_string_handle(
         handle_small, train_dataset.output_types, train_dataset.output_shapes)
     next_element_small = iterator_structure_small.get_next()
     train_iterator = train_dataset.make_initializable_iterator()
-    validate_iterator = validation_dataset.make_initializable_iterator()
+    valid_iterator = valid_dataset.make_initializable_iterator()
 
     # Model
-    model = MyModel(input_shape=[None, None, None, input_channels],
-                    target_shape=[None, None, None, target_channels],
-                    loss_name="L1", if_albedo_in_training=False)
+    model = MyModel(input_shape=[None, None, None, INPUT_CHANNEL],
+        target_shape=[None, None, None, TARGET_CHANNEL],
+        loss_name="L1", if_albedo_in_training=False)
     with tf.device("/gpu:0"):
         ae_net = model.inference()
 
@@ -153,69 +149,59 @@ if __name__ == "__main__":
 
     sess.run(tf.global_variables_initializer())
 
-    print('Stage 1 starts: ')
+    print('Start Training: ')
     min_loss = 10000
     summary_merge = tf.summary.merge_all()
-    summary_writer = tf.summary.FileWriter(stg1_summary_dir, graph=sess.graph)
+    summary_writer = tf.summary.FileWriter(summarylog_dir, graph=sess.graph)
     begin_time_train = time.time()
     
-    training_handle = sess.run(train_iterator.string_handle())
-    validation_handle = sess.run(validate_iterator.string_handle())
+    train_handle = sess.run(train_iterator.string_handle())
+    valid_handle = sess.run(valid_iterator.string_handle())
 
     train_psnr_epoch_mean = []
     train_loss_epoch_mean = []
+    valid_psnr_epoch_mean = []
+    valid_loss_epoch_mean = []
 
-    validate_psnr_epoch_mean = []
-    validate_loss_epoch_mean = []
-
-    for epoch_i in range(total_epochs_stage1):
-        should_validate = ((epoch_i + 1) % validate_interval == 0)
-
+    for epoch_i in range(total_epochs):
+        # Training
         epoch_avg_loss_train = 0.0
         epoch_avg_psnr_train = 0.0
-
         batch_cnt = 0
-        # Training
         sess.run(train_iterator.initializer)
         while True:
             try:
                 src_hdr, tgt_hdr = sess.run(next_element_small,
-                    feed_dict={handle_small: training_handle})
+                    feed_dict={handle_small: train_handle})
                 feed_dict = {ae_net['source']: src_hdr, ae_net['target']: tgt_hdr}
                 summary, denoised_1_bd, batch_loss, _ = sess.run(
                     [summary_merge, ae_net['denoised_1_bd'], loss_grid_L1, train_step1], feed_dict)
-                summary_writer.add_summary(summary, epoch_i)
+                # summary_writer.add_summary(summary, epoch_i)
 
-                denoised_1_tm = tone_mapping(denoised_1_bd)
-                tgt = tone_mapping(tgt_hdr)
-
-                _, batch_psnr_val = batch_psnr(denoised_1_tm, tgt)
-
+                _, batch_psnr_val = batch_psnr(tone_mapping(denoised_1_bd), tone_mapping(tgt_hdr))
                 epoch_avg_psnr_train += batch_psnr_val
                 epoch_avg_loss_train += batch_loss
-
                 batch_cnt += 1
             except tf.errors.OutOfRangeError:
                 epoch_avg_psnr_train /= batch_cnt
                 epoch_avg_loss_train /= batch_cnt
-
                 train_psnr_epoch_mean.append(epoch_avg_psnr_train)
                 train_loss_epoch_mean.append(epoch_avg_loss_train)
 
-                print('S1, Epoch %d Train\npsnr = %.4f\nloss = %.4f'% (
+                print('Epoch %d Train\n, psnr %.8f\nloss = %.8f'% (
                     epoch_i, epoch_avg_psnr_train, epoch_avg_loss_train))
                 break
         # Validate
+        should_validate = ((epoch_i + 1) % valid_interval == 0)
         if should_validate:
-            epoch_avg_loss_validate = 0.0
-            epoch_avg_psnr_validate = 0.0
+            epoch_avg_loss_valid = 0.0
+            epoch_avg_psnr_valid = 0.0
             batch_cnt = 0
-
-            sess.run(validate_iterator.initializer)
+            sess.run(valid_iterator.initializer)
             while True:
                 try:
                     src_hdr, tgt_hdr = sess.run(next_element_small,
-                        feed_dict={handle_small: validation_handle})
+                        feed_dict={handle_small: valid_handle})
                     feed_dict = {ae_net['source']: src_hdr, ae_net['target']: tgt_hdr}
                     denoised_1_bd, noisy_1, denoised_hdr_1, kernel_alpha_1, \
                     denoised_2_bd, noisy_2, denoised_hdr_2, kernel_alpha_2, \
@@ -241,78 +227,77 @@ if __name__ == "__main__":
                     denoised_3_tm = tone_mapping(denoised_hdr_3)
 
                     tgt = tone_mapping(tgt_hdr)
-                    src = tone_mapping(src_hdr)
+                    src = tone_mapping(src_hdr[:,:,:,0:3])
 
                     _, batch_psnr_val = batch_psnr(denoised_1_bd_tm, tgt)
+                    epoch_avg_psnr_valid += batch_psnr_val
+                    epoch_avg_loss_valid += batch_loss
 
-                    epoch_avg_psnr_validate += batch_psnr_val
-                    epoch_avg_loss_validate += batch_loss
-
-                    if batch_cnt in validation_disp_list:
+                    if batch_cnt in VALID_DISPLAY_LIST:
                         for k in range(tgt.shape[0]):
-                            save_image_pil(result_dir, tgt[k, :, :, :],
-                                'e' + str(epoch_i) + '_b' + str(batch_cnt) + '_idx' + str(k) + '_tgt')
-                            
-                            save_image_pil(result_dir, noisy_1_tm[k, :, :, :],
-                                'e' + str(epoch_i) + '_b' + str(batch_cnt) + '_idx' + str(k) + '_1_1_noisy')
-                            save_image_pil(result_dir, noisy_2_tm[k, :, :, :],
-                                'e' + str(epoch_i) + '_b' + str(batch_cnt) + '_idx' + str(k) + '_2_1_noisy')
-                            save_image_pil(result_dir, noisy_3_tm[k, :, :, :],
-                                'e' + str(epoch_i) + '_b' + str(batch_cnt) + '_idx' + str(k) + '_3_1_noisy')
+                            save_image(tgt[k, :, :, :],
+                                os.path.join(result_dir, 'e%d_b%d_i%d_tgt.png'%(epoch_i, batch_cnt, k)), 'RGB')
+                            save_image(denoised_1_bd_tm[k, :, :, :],
+                                os.path.join(result_dir, 'e%d_b%d_i%d_rcn.png'%(epoch_i, batch_cnt, k)), 'RGB')
+                            save_image(src[k,:,:,:],
+                                os.path.join(result_dir, 'e%d_b%d_i%d_src.png'%(epoch_i, batch_cnt, k)), 'RGB')
 
-                            save_image_pil(result_dir, denoised_1_tm[k, :, :, :],
-                                'e' + str(epoch_i) + '_b' + str(batch_cnt) + '_idx' + str(k) + '_1_2_denoised')
-                            save_image_pil(result_dir, denoised_2_tm[k, :, :, :],
-                                'e' + str(epoch_i) + '_b' + str(batch_cnt) + '_idx' + str(k) + '_2_2_denoised')
-                            save_image_pil(result_dir, denoised_3_tm[k, :, :, :],
-                                'e' + str(epoch_i) + '_b' + str(batch_cnt) + '_idx' + str(k) + '_3_2_denoised')
+                            if args.export_all:
+                                save_image(noisy_1_tm[k, :, :, :], 
+                                    os.path.join(result_dir, 'e%d_b%d_i%d_full_noisy.png'%(epoch_i, batch_cnt, k)))
+                                save_image(noisy_2_tm[k, :, :, :], 
+                                    os.path.join(result_dir, 'e%d_b%d_i%d_half_noisy.png'%(epoch_i, batch_cnt, k)))
+                                save_image(noisy_3_tm[k, :, :, :], 
+                                    os.path.join(result_dir, 'e%d_b%d_i%d_quat_noisy.png'%(epoch_i, batch_cnt, k)))
 
-                            save_image_pil(result_dir, denoised_1_bd_tm[k, :, :, :],
-                                'e' + str(epoch_i) + '_b' + str(batch_cnt) + '_idx' + str(k) + '_1_3_final')
-                            save_image_pil(result_dir, denoised_2_bd_tm[k, :, :, :],
-                                'e' + str(epoch_i) + '_b' + str(batch_cnt) + '_idx' + str(k) + '_2_3_final')
-                            save_image_pil(result_dir, denoised_3_bd_tm[k, :, :, :],
-                                'e' + str(epoch_i) + '_b' + str(batch_cnt) + '_idx' + str(k) + '_3_3_final')
+                                save_image(denoised_1_tm[k,:, :],
+                                    os.path.join(result_dir, 'e%d_b%d_i%d_full_denoised.png'%(epoch_i, batch_cnt, k)))
+                                save_image(denoised_2_tm[k,:, :],
+                                    os.path.join(result_dir, 'e%d_b%d_i%d_half_denoised.png'%(epoch_i, batch_cnt, k)))
+                                save_image(denoised_3_tm[k,:, :],
+                                    os.path.join(result_dir, 'e%d_b%d_i%d_quat_denoised.png'%(epoch_i, batch_cnt, k)))
 
-                            save_image_gray(result_dir, kernel_alpha_1[k, :, :, 0],
-                                'e' + str(epoch_i) + '_b' + str(batch_cnt) + '_idx' + str(k) + '_1_4_alpha')
-                            save_image_gray(result_dir, kernel_alpha_2[k, :, :, 0],
-                                'e' + str(epoch_i) + '_b' + str(batch_cnt) + '_idx' + str(k) + '_2_4_alpha')
-                            save_image_gray(result_dir, kernel_alpha_3[k, :, :, 0],
-                                'e' + str(epoch_i) + '_b' + str(batch_cnt) + '_idx' + str(k) + '_3_4_alpha')
+                                save_image(denoised_1_bd_tm[k,:, :],
+                                    os.path.join(result_dir, 'e%d_b%d_i%d_full_denoised_blend.png'%(epoch_i, batch_cnt, k)))
+                                save_image(denoised_2_bd_tm[k,:, :],
+                                    os.path.join(result_dir, 'e%d_b%d_i%d_half_denoised_blend.png'%(epoch_i, batch_cnt, k)))
+                                save_image(denoised_3_bd_tm[k,:, :],
+                                    os.path.join(result_dir, 'e%d_b%d_i%d_quat_denoised_blend.png'%(epoch_i, batch_cnt, k)))
 
-                            save_image_pil(result_dir, src[k, :, :, 0:3],
-                                'e' + str(epoch_i) + '_b' + str(batch_cnt) + '_idx' + str(k) + '_src')
+                                save_image(kernel_alpha_1[k,:, :, 0],
+                                    os.path.join(result_dir, 'e%d_b%d_i%d_full_alpha.png'%(epoch_i, batch_cnt, k)))
+                                save_image(kernel_alpha_2[k,:, :, 0],
+                                    os.path.join(result_dir, 'e%d_b%d_i%d_half_alpha.png'%(epoch_i, batch_cnt, k)))
+                                save_image(kernel_alpha_3[k,:, :, 0],
+                                    os.path.join(result_dir, 'e%d_b%d_i%d_quat_alpha.png'%(epoch_i, batch_cnt, k)))
                     batch_cnt += 1
                 except tf.errors.OutOfRangeError:
-                    epoch_avg_psnr_validate /= batch_cnt
-                    epoch_avg_loss_validate /= batch_cnt
+                    epoch_avg_psnr_valid /= batch_cnt
+                    epoch_avg_loss_valid /= batch_cnt
+                    valid_psnr_epoch_mean.append(epoch_avg_psnr_valid)
+                    valid_loss_epoch_mean.append(epoch_avg_loss_valid)
 
-                    validate_psnr_epoch_mean.append(epoch_avg_psnr_validate)
-                    validate_loss_epoch_mean.append(epoch_avg_loss_validate)
-
-                    print('S1, Epoch %d Valid\npsnr = %.4f\nloss = %.4f'% (
-                        epoch_i, epoch_avg_psnr_validate, epoch_avg_loss_validate))
-                    if epoch_avg_loss_validate < min_loss:
-                        saver.save(sess, os.path.join(stg1_model_dir, 'best_model'))
-                        min_loss = epoch_avg_loss_validate
-                    break             
+                    print('Epoch %d Valid\n, psnr %.8f\nloss = %.8f'% (
+                        epoch_i, epoch_avg_psnr_valid, epoch_avg_loss_valid))
+                    if epoch_avg_loss_valid < min_loss:
+                        print("best model saved")
+                        saver.save(sess, os.path.join(model_dir, 'best_model'))
+                        min_loss = epoch_avg_loss_valid
+                    break            
         # Validate epoch finished.
     # Stage 1 Training finished.
-    stage1_total_time = time.time() - begin_time_train
-    print("Stage 1 done, total training time = %.4fs " % (stage1_total_time))
+    total_time = time.time() - begin_time_train
+    print("Training done, total training time = %.4fs " % (total_time))
 
-    # saver.save(sess, os.path.join(stg1_model_dir, 'my_model'))
-
-    np.savetxt(err_log_dir + '/S1_psnr_train.txt',
-               train_psnr_epoch_mean, fmt='%.8f', delimiter=',')
-    np.savetxt(err_log_dir + '/S1_loss_train.txt',
-               train_loss_epoch_mean, fmt='%.8f', delimiter=',')
-
-    np.savetxt(err_log_dir + '/S1_psnr_valid.txt',
-               validate_psnr_epoch_mean, fmt='%.8f', delimiter=',')
-    np.savetxt(err_log_dir + '/S1_loss_valid.txt',
-               validate_loss_epoch_mean, fmt='%.8f', delimiter=',')
+    np.savetxt(os.path.join(errorlog_dir, 'psnr_train.txt'),
+        train_psnr_epoch_mean, fmt='%.8f', delimiter=',')
+    np.savetxt(os.path.join(errorlog_dir, 'loss_train.txt'),
+        train_loss_epoch_mean, fmt='%.8f', delimiter=',')
+    np.savetxt(os.path.join(errorlog_dir, 'psnr_valid.txt'),
+        valid_psnr_epoch_mean, fmt='%.8f', delimiter=',')
+    np.savetxt(os.path.join(errorlog_dir, 'loss_valid.txt'),
+        valid_loss_epoch_mean, fmt='%.8f', delimiter=',')
 
     summary_writer.close()
+    sess.close()
 

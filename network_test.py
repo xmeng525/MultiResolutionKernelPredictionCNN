@@ -5,207 +5,210 @@ Github: https://github.com/xmeng525/MultiResolutionKernelPredictionCNN
 @author: Xiaoxu Meng (xiaoxumeng1993@gmail.com)
 """
 
-import time
-import tensorflow as tf
-from dataLoader import dataLoader
-from network import MyModel
 import os
+import time
+import argparse
 import numpy as np
-from image_utils import *
+import tensorflow as tf
 from tensorflow.python.client import timeline
 
-# Training Parameters
-learning_rate = 0.0001
+from data_loader import dataLoader
+from network import MyModel
+from image_utils import save_image, save_exr
 
-# Batch Parameters
-user_batch_size = 10 # for training and validation
-test_batch_size = 1 # for test
+IMAGE_WIDTH = 1280
+IMAGE_HEIGHT = 720
 
-patch_width = 128
-patch_height = 128
+PADDING_HEIGHT = IMAGE_HEIGHT + 16
 
-original_width = 1280  # 1024
-original_height = 720  # 576
+INPUT_CHANNEL = 10
+TARGET_CHANNEL = 3
 
-whole_width = original_width
-whole_height = original_height + 16
+parser = argparse.ArgumentParser()
+parser.add_argument('-d', '--dataset-name', type=str, 
+	default="classroom")
+parser.add_argument('-r', '--data-dir', type=str, 
+	default='../../dataset/dataset_blockwise/BMFR-dataset')
+parser.add_argument('-bs', '--batch-size', type=int, default=1)
+parser.add_argument('-ts', '--test-size', type=int, default=60)
+parser.add_argument('--export_exr',action='store_true')
+parser.add_argument('--export_all',action='store_true')
+args = parser.parse_args()
 
-test_per_scene = 60
-test_start_idx = 0
-
-patch_per_img = 50
-
-input_channels = 10
-target_channels = 3
-
-data_dir = r'../../dataset/dataset_blockwise/BMFR-dataset'
-scene_train_list = ['san-miguel', 'sponza', 'living-room', 'sponza-moving-light', 'sponza-glossy']
-scene_validate_list = ['san-miguel', 'sponza', 'living-room', 'sponza-moving-light', 'sponza-glossy']
-scene_test_list = ['classroom']
+data_dir = args.data_dir
+scene_test_list = args.dataset_name.split(' ')
+test_batch_size = args.batch_size
+test_per_scene = args.test_size
 
 def tone_mapping(input_image):
-    tone_mapped_color = np.clip(
-        np.power(np.maximum(0., input_image), 0.454545), 0., 1.)
-    return tone_mapped_color
+	tone_mapped_color = np.clip(
+		np.power(np.maximum(0., input_image), 0.454545), 0., 1.)
+	return tone_mapped_color
 
 def _parse_function_testdata(proto):
-    # with tf.name_scope("parse_test_data"):
-    features = tf.parse_single_example(
-        proto, features={
-            'target': tf.FixedLenFeature([], tf.string),
-            'input': tf.FixedLenFeature([], tf.string)})
+	# with tf.name_scope("parse_test_data"):
+	features = tf.parse_single_example(
+		proto, features={
+			'target': tf.FixedLenFeature([], tf.string),
+			'input': tf.FixedLenFeature([], tf.string)})
 
-    train_input = tf.decode_raw(features['input'], tf.float16)
-    train_input = tf.reshape(train_input, [whole_height,
-                                           whole_width, input_channels])
+	train_input = tf.decode_raw(features['input'], tf.float16)
+	train_input = tf.reshape(train_input, [IMAGE_HEIGHT,
+										   IMAGE_WIDTH, INPUT_CHANNEL])
 
-    train_target = tf.decode_raw(features['target'], tf.float16)
-    train_target = tf.reshape(train_target, [whole_height,
-                                             whole_width, target_channels])
-    return (train_input, train_target)
-
-def my_mkdir(name):
-    if not os.path.exists(name):
-        print('creating folder', name)
-        os.makedirs(name)
+	train_target = tf.decode_raw(features['target'], tf.float16)
+	train_target = tf.reshape(train_target, [IMAGE_HEIGHT,
+											 IMAGE_WIDTH, TARGET_CHANNEL])
+	return (train_input, train_target)
 
 if __name__ == "__main__":
-    # Summary log directory
-    summary_dir = r'./summary_log'
-    result_dir = r'./result/stage1'
-    my_mkdir(result_dir)
-    err_log_dir = r'./errorlogs'
-    model_dir = r'./model'
-    stg1_model_dir = os.path.join(model_dir, 'stage1')
+	model_dir = os.path.join(scene_test_list[0], 'model')
+	result_dir = os.path.join(scene_test_list[0], 'result', 'test_out')
+	errorlog_dir = os.path.join(scene_test_list[0], 'errorlog')
+	summarylog_dir = os.path.join(scene_test_list[0], 'summarylog')
 
-    seed = 1
-    rng = np.random.RandomState(seed)
-    test_data = dataLoader(data_dir=data_dir, subset='test',
-                           patch_width=patch_width,
-                           patch_height=patch_height,
-                           image_start_idx=test_start_idx,
-                           img_per_scene=test_per_scene,
-                           patch_per_img=patch_per_img,
-                           scene_list=scene_test_list, rng=rng)
+	os.makedirs(model_dir, exist_ok=True)
+	os.makedirs(result_dir, exist_ok=True)
+	os.makedirs(errorlog_dir, exist_ok=True)
+	os.makedirs(summarylog_dir, exist_ok=True)
 
-    # Test
-    test_dataset = tf.data.TFRecordDataset([test_data.dataset_name])
-    test_dataset = test_dataset.map(_parse_function_testdata)
-    test_dataset = test_dataset.batch(test_batch_size)
+	test_data = dataLoader(data_dir=data_dir, subset='test',
+						   image_start_idx=0,
+						   img_per_scene=test_per_scene,
+						   scene_list=scene_test_list)
 
-    handle_large = tf.placeholder(tf.string, shape=[])
-    iterator_structure_large = tf.data.Iterator.from_string_handle(
-         handle_large, test_dataset.output_types, test_dataset.output_shapes)
-    next_element_large = iterator_structure_large.get_next()
-    test_iterator = test_dataset.make_initializable_iterator()
+	# Test
+	test_dataset = tf.data.TFRecordDataset([test_data.dataset_name])
+	test_dataset = test_dataset.map(_parse_function_testdata)
+	test_dataset = test_dataset.batch(test_batch_size)
 
-    # Model
-    model = MyModel(input_shape=[None, None, None, input_channels],
-                    target_shape=[None, None, None, target_channels],
-                    loss_name="L1", if_albedo_in_training=False)
-    with tf.device("/gpu:0"):
-        ae_net = model.inference()
+	handle_large = tf.placeholder(tf.string, shape=[])
+	iterator_structure_large = tf.data.Iterator.from_string_handle(
+		 handle_large, test_dataset.output_types, test_dataset.output_shapes)
+	next_element_large = iterator_structure_large.get_next()
+	test_iterator = test_dataset.make_initializable_iterator()
 
-    saver = tf.train.Saver()
-    config = tf.ConfigProto(allow_soft_placement=True, graph_options=tf.GraphOptions(
-        optimizer_options=tf.OptimizerOptions(opt_level=tf.OptimizerOptions.L0)))
-    config.gpu_options.allow_growth = True
-    sess = tf.Session(config=config)
+	# Model
+	model = MyModel(input_shape=[None, None, None, INPUT_CHANNEL],
+		target_shape=[None, None, None, TARGET_CHANNEL],
+		loss_name="L1", if_albedo_in_training=False)
+	with tf.device("/gpu:0"):
+		ae_net = model.inference()
 
-    run_metadata = tf.RunMetadata()
-    run_options = tf.RunOptions(trace_level=tf.RunOptions.FULL_TRACE)
-    opts1 = tf.profiler.ProfileOptionBuilder.float_operation()
-    flops = tf.profiler.profile(sess.graph, run_meta=run_metadata, cmd='op', options=opts1)
+	saver = tf.train.Saver()
+	config = tf.ConfigProto(allow_soft_placement=True, graph_options=tf.GraphOptions(
+		optimizer_options=tf.OptimizerOptions(opt_level=tf.OptimizerOptions.L0)))
+	config.gpu_options.allow_growth = True
+	sess = tf.Session(config=config)
 
-    opts2 = tf.profiler.ProfileOptionBuilder.trainable_variables_parameter()
-    params = tf.profiler.profile(sess.graph, run_meta=run_metadata, cmd='op', options=opts2)
+	run_metadata = tf.RunMetadata()
+	run_options = tf.RunOptions(trace_level=tf.RunOptions.FULL_TRACE)
+	opts1 = tf.profiler.ProfileOptionBuilder.float_operation()
+	flops = tf.profiler.profile(sess.graph, run_meta=run_metadata, cmd='op', options=opts1)
 
-    sess.run(tf.global_variables_initializer())
-    saver.restore(sess, os.path.join(stg1_model_dir, 'best_model'))
-    
-    # Test
-    print('Start Testing...')
+	opts2 = tf.profiler.ProfileOptionBuilder.trainable_variables_parameter()
+	params = tf.profiler.profile(sess.graph, run_meta=run_metadata, cmd='op', options=opts2)
 
-    epoch_avg_psnr_test = 0.0
-    epoch_avg_loss_test = 0.0
+	sess.run(tf.global_variables_initializer())
+	saver.restore(sess, os.path.join(model_dir, 'best_model'))
+	
+	# Test
+	print('Start Testing...')
+	batch_cnt = 0
+	sess.run(test_iterator.initializer)
+	test_handle = sess.run(test_iterator.string_handle())
 
-    batch_cnt = 0
+	while True:
+		try:
+			src_hdr_in, tgt_hdr_in = sess.run(next_element_large,
+				feed_dict={handle_large: test_handle})
+			src_hdr = np.zeros((test_batch_size, PADDING_HEIGHT, IMAGE_WIDTH, INPUT_CHANNEL))
+			tgt_hdr = np.zeros((test_batch_size, PADDING_HEIGHT, IMAGE_WIDTH, TARGET_CHANNEL))
+			src_hdr[:,0:IMAGE_HEIGHT,:,:] = src_hdr_in
+			tgt_hdr[:,0:IMAGE_HEIGHT,:,:] = tgt_hdr_in
 
-    sess.run(test_iterator.initializer)
-    test_handle = sess.run(test_iterator.string_handle())
+			feed_dict = {ae_net['source']: src_hdr, ae_net['target']: tgt_hdr}
+			denoised_1_bd, noisy_1, denoised_hdr_1, kernel_alpha_1, \
+			denoised_2_bd, noisy_2, denoised_hdr_2, kernel_alpha_2, \
+			denoised_3_bd, noisy_3, denoised_hdr_3, kernel_alpha_3, \
+			batch_loss = sess.run(
+				[
+					ae_net['denoised_1_bd'], ae_net['noisy_1'], ae_net['denoised_hdr_1'], ae_net['kernel_alpha_1'],
+					ae_net['denoised_2_bd'], ae_net['noisy_2'], ae_net['denoised_hdr_2'], ae_net['kernel_alpha_2'],
+					ae_net['denoised_3_bd'], ae_net['noisy_3'], ae_net['denoised_hdr_3'], ae_net['kernel_alpha_3'],
+					ae_net['loss_denoised']
+				], feed_dict, options=run_options, run_metadata=run_metadata)
 
-    while True:
-        try:
-            src_hdr, tgt_hdr = sess.run(next_element_large,
-                feed_dict={handle_large: test_handle})
-            feed_dict = {ae_net['source']: src_hdr, ae_net['target']: tgt_hdr}
-            denoised_1_bd, noisy_1, denoised_hdr_1, kernel_alpha_1, \
-            denoised_2_bd, noisy_2, denoised_hdr_2, kernel_alpha_2, \
-            denoised_3_bd, noisy_3, denoised_hdr_3, kernel_alpha_3, \
-            batch_loss = sess.run(
-                [
-                    ae_net['denoised_1_bd'], ae_net['noisy_1'], ae_net['denoised_hdr_1'], ae_net['kernel_alpha_1'],
-                    ae_net['denoised_2_bd'], ae_net['noisy_2'], ae_net['denoised_hdr_2'], ae_net['kernel_alpha_2'],
-                    ae_net['denoised_3_bd'], ae_net['noisy_3'], ae_net['denoised_hdr_3'], ae_net['kernel_alpha_3'],
-                    ae_net['loss_denoised']
-                ], feed_dict, options=run_options, run_metadata=run_metadata)
+			tl = timeline.Timeline(run_metadata.step_stats)
+			ctf = tl.generate_chrome_trace_format(show_memory=True)
+			with open(os.path.join(errorlog_dir, 'timeline.json'),'w') as wd:
+				wd.write(ctf)
 
-            tl = timeline.Timeline(run_metadata.step_stats)
-            ctf = tl.generate_chrome_trace_format(show_memory=True)
-            with open(os.path.join(err_log_dir, 'timeline.json'),'w') as wd:
-                wd.write(ctf)
+			tgt = tone_mapping(tgt_hdr_in)
+			src_hdr_in = src_hdr_in[:,:,:,0:3] * src_hdr_in[:,:,:,3:6]
+			src = tone_mapping(src_hdr_in)
 
-            denoised_1_bd_tm = tone_mapping(denoised_1_bd)
-            denoised_2_bd_tm = tone_mapping(denoised_2_bd)
-            denoised_3_bd_tm = tone_mapping(denoised_3_bd)
+			denoised_1_bd_tm = tone_mapping(denoised_1_bd)
+			denoised_2_bd_tm = tone_mapping(denoised_2_bd)
+			denoised_3_bd_tm = tone_mapping(denoised_3_bd)
 
-            noisy_1_tm = tone_mapping(noisy_1)
-            noisy_2_tm = tone_mapping(noisy_2)
-            noisy_3_tm = tone_mapping(noisy_3)
+			if args.export_all:
+				noisy_1_tm = tone_mapping(noisy_1)
+				noisy_2_tm = tone_mapping(noisy_2)
+				noisy_3_tm = tone_mapping(noisy_3)
 
-            denoised_1_tm = tone_mapping(denoised_hdr_1)
-            denoised_2_tm = tone_mapping(denoised_hdr_2)
-            denoised_3_tm = tone_mapping(denoised_hdr_3)
+				denoised_1_tm = tone_mapping(denoised_hdr_1)
+				denoised_2_tm = tone_mapping(denoised_hdr_2)
+				denoised_3_tm = tone_mapping(denoised_hdr_3)
 
-            tgt = tone_mapping(tgt_hdr)
-            src = tone_mapping(src_hdr)
+			for k in range(0, src_hdr.shape[0]): 
+				idx_all = batch_cnt * test_batch_size + k
+				save_image(tgt[k, :, :, :], os.path.join(result_dir, '%d_tgt.png'%idx_all), 'RGB')
+				save_image(src[k, :, :, :], os.path.join(result_dir, '%d_src.png'%idx_all), 'RGB')
+				save_image(denoised_1_bd_tm[k, 0:IMAGE_HEIGHT, :, :], 
+					os.path.join(result_dir, '%d_rcn.png'%idx_all), 'RGB')
 
-            _, batch_psnr_val = batch_psnr(
-                denoised_1_bd_tm[:, 0:original_height, 0:original_width,:], 
-                tgt[:, 0:original_height, 0:original_width,:])
+				if args.export_exr:
+					save_exr(src_hdr_in[k,:,:,:], 
+						os.path.join(result_dir, '%d_src.exr'%idx_all))
+					save_exr(tgt_hdr_in[k,:,:,:], 
+						os.path.join(result_dir, '%d_tgt.exr'%idx_all))
+					save_exr(denoised_1_bd[k,0:IMAGE_HEIGHT,:,:], 
+						os.path.join(result_dir, '%d_rcn.exr'%idx_all))
 
-            epoch_avg_psnr_test += batch_psnr_val
-            epoch_avg_loss_test += batch_loss
+				if args.export_all:
+					save_image(noisy_1_tm[k, 0:IMAGE_HEIGHT, :, :], 
+						os.path.join(result_dir, '%d_full_res_noisy.png'%idx_all), 'RGB')
+					save_image(noisy_2_tm[k, :, :, :], 
+						os.path.join(result_dir, '%d_half_res_noisy.png'%idx_all), 'RGB')
+					save_image(noisy_3_tm[k, :, :, :], 
+						os.path.join(result_dir, '%d_quat_res_noisy.png'%idx_all), 'RGB')
 
-            for k in range(0, tgt.shape[0]): 
-                idx_all = batch_cnt * test_batch_size + k
-                save_image_pil(result_dir, tgt[k, :, :, :], str(idx_all) + '_tgt')
-                
-                save_image_pil(result_dir, noisy_1_tm[k, :, :, :], str(idx_all) + '_1_1_noisy')
-                # save_image_pil(result_dir, noisy_2_tm[k, :, :, :], str(idx_all) + '_2_1_noisy')
-                # save_image_pil(result_dir, noisy_3_tm[k, :, :, :], str(idx_all) + '_3_1_noisy')
+					save_image(denoised_1_tm[k, 0:IMAGE_HEIGHT, :, :], 
+						os.path.join(result_dir, '%d_full_res_denoised.png'%idx_all), 'RGB')
+					save_image(denoised_2_tm[k, :, :, :], 
+						os.path.join(result_dir, '%d_half_res_denoised.png'%idx_all), 'RGB')
+					save_image(denoised_3_tm[k, :, :, :], 
+						os.path.join(result_dir, '%d_quat_res_denoised.png'%idx_all), 'RGB')
 
-                # save_image_pil(result_dir, denoised_1_tm[k, :, :, :], str(idx_all) + '_1_2_denoised')
-                # save_image_pil(result_dir, denoised_2_tm[k, :, :, :], str(idx_all) + '_2_2_denoised')
-                # save_image_pil(result_dir, denoised_3_tm[k, :, :, :], str(idx_all) + '_3_2_denoised')
+					save_image(denoised_1_bd_tm[k, 0:IMAGE_HEIGHT, :, :], 
+						os.path.join(result_dir, '%d_full_res_denoised_blended.png'%idx_all), 'RGB')
+					save_image(denoised_2_bd_tm[k, :, :, :], 
+						os.path.join(result_dir, '%d_half_res_denoised_blended.png'%idx_all), 'RGB')
+					save_image(denoised_3_bd_tm[k, :, :, :], 
+						os.path.join(result_dir, '%d_quat_res_denoised_blended.png'%idx_all), 'RGB')
 
-                save_image_pil(result_dir, denoised_1_bd_tm[k, :, :, :], str(idx_all) + '_1_3_final')
-                # save_image_pil(result_dir, denoised_2_bd_tm[k, :, :, :], str(idx_all) + '_2_3_final')
-                # save_image_pil(result_dir, denoised_3_bd_tm[k, :, :, :], str(idx_all) + '_3_3_final')
-
-                # save_image_gray(result_dir, kernel_alpha_1[k, :, :, 0], str(idx_all) + '_1_4_alpha')
-                # save_image_gray(result_dir, kernel_alpha_2[k, :, :, 0], str(idx_all) + '_2_4_alpha')
-                # save_image_gray(result_dir, kernel_alpha_3[k, :, :, 0], str(idx_all) + '_3_4_alpha')
-
-                save_image_pil(result_dir, src[k, :, :, :], str(idx_all) + '_src')
-            batch_cnt += 1
-        except tf.errors.OutOfRangeError:
-            epoch_avg_psnr_test /= batch_cnt
-            epoch_avg_loss_test /= batch_cnt
-
-            print('Test ends\npsnr = %.4f\nloss = %.4f' % (epoch_avg_psnr_test, epoch_avg_loss_test))
-            break
-    sess.close()
+					save_image(kernel_alpha_1[k, 0:IMAGE_HEIGHT, :, 0], 
+						os.path.join(result_dir, '%d_full_alpha.png'%idx_all))
+					save_image(kernel_alpha_2[k, :, :, 0], 
+						os.path.join(result_dir, '%d_half_alpha.png'%idx_all))
+					save_image(kernel_alpha_3[k, :, :, 0], 
+						os.path.join(result_dir, '%d_quat_alpha.png'%idx_all))
+			batch_cnt += 1
+		except tf.errors.OutOfRangeError:
+			print('Finish testing %d images.' % (batch_cnt * test_batch_size))
+			break
+	sess.close()
 
 
 
