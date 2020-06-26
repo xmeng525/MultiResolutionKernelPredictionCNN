@@ -55,8 +55,11 @@ If you find this implementation useful in your research, please consider citing:
 If you are using 
 4. Recompile the bilateral kernels by running
 ```
-cd bilateral_kernels
-./bilateral_kernel.sh
+cd 0_kernel_functions
+./kernel_filter.sh
+cd ..
+cd 0_upsampling
+./upsampling.sh
 cd ..
 ```
 5. Apply the denoiser by running
